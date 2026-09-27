@@ -35,7 +35,8 @@
 #   NP_LEAN_PROCS     leanserver --max-processes     (default 24)
 #   NP_RSS_LIMIT_GIB  per-REPL-worker hard memory cap (default 16)
 #   NP_PSS_RECYCLE_GIB worker recycle threshold       (default 6)
-#   NP_WARMUP_WAIT    seconds to let leanserver import Mathlib before RL/eval (default 900)
+#   NP_WARMUP_WAIT    max seconds to wait for leanserver's /status to report "ready"
+#                     (all workers imported Mathlib) before RL/eval (default 900)
 #   NP_PORT           leanserver port                (default 8000)
 #   NP_FORCE          1 = re-run a training stage even if it already has a checkpoint
 #   NP_CKPT           checkpoint for serve and eval (default: newest rl, else newest sft);
@@ -283,13 +284,36 @@ EOF
     ( cd "$LEAN_PROJECT" && lake update && lake build )
 }
 
+# True if the pid file names a live leanserver (not a stale pid reused by
+# another process after a crash or reboot). Match the console-script name or
+# the --repl-exe flag we pass, since some interpreters rewrite argv[0].
+leanserver_alive() {
+    local pid
+    [ -f "$SERVER_PID_FILE" ] || return 1
+    pid="$(cat "$SERVER_PID_FILE")"
+    kill -0 "$pid" 2>/dev/null \
+        && ps -o command= -p "$pid" 2>/dev/null | grep -q -e leanserver -e '--repl-exe'
+}
+
+leanserver_status() {  # prints the /status JSON, or fails if nothing answers
+    curl -sf --max-time 5 "http://127.0.0.1:$PORT/status"
+}
+
 do_leanserver() {
     [ -x "$LEANSERVER" ] || LEANSERVER="$(command -v leanserver || true)"
     [ -n "$LEANSERVER" ] || die "leanserver not found; run the setup stage (installed with leantree)"
     [ -x "$REPL_EXE" ] || die "REPL fork not built; run the setup stage"
     [ -d "$LEAN_PROJECT/.lake" ] || die "Lean project not built; run the leanproj stage"
-    if [ -f "$SERVER_PID_FILE" ] && kill -0 "$(cat "$SERVER_PID_FILE")" 2>/dev/null; then
-        log "leanserver: already running (pid $(cat "$SERVER_PID_FILE"))"; return
+    if leanserver_alive; then
+        log "leanserver: already running (pid $(cat "$SERVER_PID_FILE"))"
+        leanserver_status >/dev/null \
+            || die "leanserver pid $(cat "$SERVER_PID_FILE") is alive but nothing answers on 127.0.0.1:$PORT — was it started on another port? see $SERVER_LOG, or 'scripts/train_nanoproof.sh stop' and retry"
+        return
+    fi
+    rm -f "$SERVER_PID_FILE"   # stale or absent
+    if leanserver_status >/dev/null; then
+        log "leanserver: something already answers on 127.0.0.1:$PORT (not started by this script); using it"
+        return
     fi
     log "leanserver: $LEAN_PROCS workers on port $PORT (log: $SERVER_LOG)"
     "$LEANSERVER" \
@@ -304,11 +328,39 @@ do_leanserver() {
         --rss-hard-limit-gib "$RSS_LIMIT" \
         --pss-recycle-limit-gib "$PSS_RECYCLE" \
         > "$SERVER_LOG" 2>&1 &
-    echo $! > "$SERVER_PID_FILE"
-    # /status reports ready before imports actually settle (README warning),
-    # so give Mathlib imports a fixed head start.
-    log "waiting ${WARMUP_WAIT}s for Mathlib import warmup..."
-    sleep "$WARMUP_WAIT"
+    local pid=$!
+    echo "$pid" > "$SERVER_PID_FILE"
+
+    # The HTTP listener binds within seconds (before the Mathlib warmup), so a
+    # server that has not answered /status after a minute is dead, not slow.
+    # Fail here with the log instead of sleeping NP_WARMUP_WAIT and letting
+    # nanoproof report a bare "Connection refused".
+    local waited=0
+    until leanserver_status >/dev/null; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "----- tail $SERVER_LOG -----" >&2; tail -30 "$SERVER_LOG" >&2
+            rm -f "$SERVER_PID_FILE"
+            die "leanserver exited during startup (see log above)"
+        fi
+        [ "$waited" -lt 60 ] || { tail -30 "$SERVER_LOG" >&2; die "leanserver did not open 127.0.0.1:$PORT within 60s; see $SERVER_LOG"; }
+        sleep 2; waited=$((waited + 2))
+    done
+    # /status reports "warming_up" until every worker has imported Mathlib.
+    # Poll for that, capped at NP_WARMUP_WAIT (a fixed head start if the
+    # field is missing on an older leantree).
+    log "leanserver: listening; waiting up to ${WARMUP_WAIT}s for Mathlib import warmup..."
+    waited=0
+    while [ "$waited" -lt "$WARMUP_WAIT" ]; do
+        local st; st="$(leanserver_status || true)"
+        kill -0 "$pid" 2>/dev/null || { tail -30 "$SERVER_LOG" >&2; rm -f "$SERVER_PID_FILE"; die "leanserver died during warmup (see log above)"; }
+        case "$st" in
+            *'"status": "ready"'*|*'"status":"ready"'*) log "leanserver: warmup complete"; return ;;
+            *'"status": "warming_up"'*|*'"status":"warming_up"'*) ;;
+            *) sleep "$WARMUP_WAIT"; return ;;   # no warmup field: fixed head start
+        esac
+        sleep 15; waited=$((waited + 15))
+    done
+    log "WARNING: leanserver still warming up after ${WARMUP_WAIT}s; continuing anyway (raise NP_WARMUP_WAIT if eval reports 0 processes)"
 }
 
 # ------------------------------------------------------------- rl / eval -----
