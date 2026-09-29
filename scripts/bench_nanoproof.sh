@@ -5,6 +5,8 @@
 #        SPLIT   valid | test (default valid)
 #        PILOT   first N theorems only, in file order (default: all)
 #        NP_WORK_DIR, NP_NUM_SAMPLES, NP_FIRST_TOKEN_CAP, NP_DISABLE_SOLVERS as in train_nanoproof.sh
+#        NP_LEAN_PROCS   Lean workers (default 24; capped to what the node's open-file
+#                        table holds), NP_WARMUP_BATCH concurrent Mathlib imports (default 8)
 # Output: <ckpt dir>/eval_<step>_minif2f[-test]_<budget>/{theorems.jsonl,summary.toml}
 #         (printed at the end; pass it to scripts/compare.py). Runs on the GPU node.
 set -euo pipefail

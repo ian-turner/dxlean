@@ -32,7 +32,11 @@
 #   NP_DEVICE_BATCH   per-GPU --device-batch-size override (nanoproof default 32;
 #                     lower to 16 or 8 if 40GB A100s OOM — gradient accumulation
 #                     keeps the effective batch identical, just slower)
-#   NP_LEAN_PROCS     leanserver --max-processes     (default 24)
+#   NP_LEAN_PROCS     leanserver --max-processes     (default 24). Lowered automatically
+#                     when the kernel's open-file table (fs.file-max) cannot hold that
+#                     many Mathlib workers; NP_FDCHECK=0 disables the check
+#   NP_WARMUP_BATCH   leanserver --warmup-batch-size: workers importing Mathlib at once
+#                     during warmup and recycle waves (default 8; 0 = no limit)
 #   NP_RSS_LIMIT_GIB  per-REPL-worker hard memory cap (default 16)
 #   NP_PSS_RECYCLE_GIB worker recycle threshold       (default 6)
 #   NP_WARMUP_WAIT    max seconds to wait for leanserver's /status to report "ready"
@@ -74,6 +78,7 @@ export NANOPROOF_HOME="${NANOPROOF_HOME:-$WORK_DIR/nanoproof-home}"
 DEPTH="${NP_DEPTH:-26}"
 FP8="${NP_FP8:-1}"
 LEAN_PROCS="${NP_LEAN_PROCS:-24}"
+WARMUP_BATCH="${NP_WARMUP_BATCH:-8}"
 RSS_LIMIT="${NP_RSS_LIMIT_GIB:-16}"
 PSS_RECYCLE="${NP_PSS_RECYCLE_GIB:-6}"
 WARMUP_WAIT="${NP_WARMUP_WAIT:-900}"
@@ -299,6 +304,57 @@ leanserver_status() {  # prints the /status JSON, or fails if nothing answers
     curl -sf --max-time 5 "http://127.0.0.1:$PORT/status"
 }
 
+# REPL workers left behind by a leanserver that died (e.g. mid-warmup) keep their
+# Mathlib mappings, and with them their share of the kernel's open-file table.
+# Only reached when no leanserver of ours is alive, so anything matching the
+# REPL binary is a stray.
+kill_stray_workers() {
+    local pids
+    pids="$(pgrep -u "$USER" -f "$REPL_EXE" || true)"
+    [ -n "$pids" ] || return 0
+    log "leanserver: killing $(echo "$pids" | wc -w | tr -d ' ') stray REPL worker(s) from an earlier run"
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
+}
+
+# Each REPL worker opens and mmaps every .olean in its import closure (all of
+# Mathlib) and keeps the mappings for life, so it pins that many entries in the
+# kernel's system-wide open-file table (fs.file-max; /proc/sys/fs/file-nr reads
+# "used free max"). Overflowing it fails the import with "Too many open files in
+# system" (ENFILE), which no ulimit -n can fix. Estimate the per-worker cost from
+# the .olean count of the project's packages and toolchain and cap LEAN_PROCS to
+# what fits, leaving 10% of the table for everything else on the node.
+fit_lean_procs() {
+    [ -r /proc/sys/fs/file-nr ] || return 0          # not Linux
+    local used max per_worker headroom fit libdir
+    read -r used _ max < /proc/sys/fs/file-nr
+    libdir="$(cd "$LEAN_PROJECT" && lake env lean --print-libdir 2>/dev/null || true)"
+    per_worker=$(( $(find "$LEAN_PROJECT/.lake/packages" ${libdir:+"$libdir"} \
+        \( -name '*.olean' -o -name '*.olean.private' \) 2>/dev/null | wc -l) ))
+    [ "$per_worker" -gt 0 ] || return 0
+    headroom=$(( (max - used) / 10 * 9 ))
+    fit=$(( headroom / per_worker ))
+    log "leanserver: open-file table $used/$max in use; ~$per_worker entries per Mathlib worker -> room for $fit"
+    if [ "$fit" -lt 1 ]; then
+        die "the kernel's open-file table cannot hold even one Mathlib worker (fs.file-max=$max, $used in use). Look for other Lean jobs on this node (ps -eo user,pid,command | grep -e repl -e lean) or ask an admin to raise fs.file-max"
+    elif [ "$fit" -lt "$LEAN_PROCS" ]; then
+        log "WARNING: lowering workers $LEAN_PROCS -> $fit to fit the open-file table (admin: sysctl -w fs.file-max=...; NP_FDCHECK=0 forces $LEAN_PROCS)"
+        LEAN_PROCS=$fit
+    fi
+}
+
+server_died() {   # $1 = what happened; names the open-file-table failure when the log shows it
+    echo "----- tail $SERVER_LOG -----" >&2; tail -30 "$SERVER_LOG" >&2
+    rm -f "$SERVER_PID_FILE"
+    kill_stray_workers
+    if grep -q "Too many open files in system" "$SERVER_LOG"; then
+        local used="?" max="?"
+        read -r used _ max < /proc/sys/fs/file-nr 2>/dev/null || true
+        die "leanserver $1: the kernel's open-file table is full (fs.file-max=$max, $used in use now; every Mathlib worker pins one entry per .olean). Use fewer workers (NP_LEAN_PROCS), check for other Lean jobs on this node, or have an admin raise fs.file-max. ulimit -n cannot help"
+    fi
+    die "leanserver $1 (see log above)"
+}
+
 do_leanserver() {
     [ -x "$LEANSERVER" ] || LEANSERVER="$(command -v leanserver || true)"
     [ -n "$LEANSERVER" ] || die "leanserver not found; run the setup stage (installed with leantree)"
@@ -315,7 +371,16 @@ do_leanserver() {
         log "leanserver: something already answers on 127.0.0.1:$PORT (not started by this script); using it"
         return
     fi
-    log "leanserver: $LEAN_PROCS workers on port $PORT (log: $SERVER_LOG)"
+    kill_stray_workers
+    [ "${NP_FDCHECK:-1}" = 0 ] || fit_lean_procs
+    local batch_flag=""
+    if "$LEANSERVER" --help 2>/dev/null | grep -q -- --warmup-batch-size; then
+        batch_flag="--warmup-batch-size $WARMUP_BATCH"
+    else
+        log "WARNING: this leantree has no --warmup-batch-size; all $LEAN_PROCS workers import Mathlib at once"
+    fi
+    log "leanserver: $LEAN_PROCS workers on port $PORT, warmup batches of $WARMUP_BATCH (log: $SERVER_LOG)"
+    # shellcheck disable=SC2086  # batch_flag is two plain words
     "$LEANSERVER" \
         --project-path "$LEAN_PROJECT" \
         --repl-exe "$REPL_EXE" \
@@ -324,7 +389,7 @@ do_leanserver() {
             FormalConjectures.Util.Answer \
         --max-processes "$LEAN_PROCS" \
         --address 127.0.0.1 --port "$PORT" \
-        --warmup \
+        --warmup $batch_flag \
         --rss-hard-limit-gib "$RSS_LIMIT" \
         --pss-recycle-limit-gib "$PSS_RECYCLE" \
         > "$SERVER_LOG" 2>&1 &
@@ -337,11 +402,7 @@ do_leanserver() {
     # nanoproof report a bare "Connection refused".
     local waited=0
     until leanserver_status >/dev/null; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            echo "----- tail $SERVER_LOG -----" >&2; tail -30 "$SERVER_LOG" >&2
-            rm -f "$SERVER_PID_FILE"
-            die "leanserver exited during startup (see log above)"
-        fi
+        kill -0 "$pid" 2>/dev/null || server_died "exited during startup"
         [ "$waited" -lt 60 ] || { tail -30 "$SERVER_LOG" >&2; die "leanserver did not open 127.0.0.1:$PORT within 60s; see $SERVER_LOG"; }
         sleep 2; waited=$((waited + 2))
     done
@@ -352,7 +413,7 @@ do_leanserver() {
     waited=0
     while [ "$waited" -lt "$WARMUP_WAIT" ]; do
         local st; st="$(leanserver_status || true)"
-        kill -0 "$pid" 2>/dev/null || { tail -30 "$SERVER_LOG" >&2; rm -f "$SERVER_PID_FILE"; die "leanserver died during warmup (see log above)"; }
+        kill -0 "$pid" 2>/dev/null || server_died "died during warmup"
         case "$st" in
             *'"status": "ready"'*|*'"status":"ready"'*) log "leanserver: warmup complete"; return ;;
             *'"status": "warming_up"'*|*'"status":"warming_up"'*) ;;
@@ -441,11 +502,17 @@ PYSERVE
 }
 
 do_stop() {
+    local pid i
     if [ -f "$SERVER_PID_FILE" ]; then
-        kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
+        pid="$(cat "$SERVER_PID_FILE")"
+        kill "$pid" 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
         rm -f "$SERVER_PID_FILE"
         log "leanserver stopped"
     fi
+    # sweep what the server's own shutdown did not reap, unless a leanserver we
+    # did not start is still serving on the port (its workers are not strays)
+    leanserver_status >/dev/null || kill_stray_workers
 }
 
 # ---------------------------------------------------------------- main -------
