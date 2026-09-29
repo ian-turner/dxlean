@@ -19,8 +19,10 @@ are reconstructed by replaying their tactic prefix from the theorem root.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -38,6 +40,10 @@ class REPLError(Exception):
 
 class REPLTimeout(REPLError):
     pass
+
+
+class REPLDead(REPLError):
+    """The REPL process exited (crash, OOM kill, ...) during a request."""
 
 
 class LeanREPL:
@@ -58,6 +64,10 @@ class LeanREPL:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            # `lake env` does not exec the binary: it forks `repl` as a child and
+            # waits. Own process group so stop() can kill both, else a timed-out
+            # `repl` outlives its `lake` and keeps computing (memory leak per restart).
+            start_new_session=True,
         )
         self._lines = queue.Queue()
         # the reader is bound to *its* queue: a killed process's late EOF must
@@ -72,21 +82,44 @@ class LeanREPL:
 
     def stop(self) -> None:
         if self.proc is not None:
-            self.proc.kill()
+            self.kill_group()
             self.proc.wait()
             self.proc = None
+
+    def kill_group(self) -> None:
+        """SIGKILL `lake` and its `repl` child (the whole process group)."""
+        assert self.proc is not None
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.proc.kill()  # no-op if the group kill got it; covers a pgid mismatch
 
     @property
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def _dead(self, what: str) -> REPLDead:
+        # give the exiting process a moment to be reapable so the exit code
+        # (e.g. -9 = killed by the OOM killer, -11 = segfault) makes the message
+        code: object = "?"
+        if self.proc is not None:
+            try:
+                code = self.proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+        return REPLDead(f"REPL process died ({what}, exit code {code})")
+
     def request(self, obj: dict, timeout: float) -> dict:
-        """Send one request, read one JSON response. Raises REPLTimeout/REPLError."""
+        """Send one request, read one JSON response. Raises REPLTimeout/REPLDead/REPLError."""
         if not self.alive:
-            raise REPLError("REPL process is not running")
+            raise self._dead("not running")
         assert self.proc is not None and self.proc.stdin is not None
-        self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n\n")
+            self.proc.stdin.flush()
+        except OSError as e:  # BrokenPipeError: the process exited between poll() and write()
+            raise self._dead(f"{type(e).__name__} on write") from e
 
         buf: list[str] = []
         deadline = time.monotonic() + timeout
@@ -99,7 +132,7 @@ class LeanREPL:
             except queue.Empty:
                 continue
             if line is None:
-                raise REPLError("REPL process closed stdout")
+                raise self._dead("closed stdout")
             if line == "":
                 if buf:
                     return json.loads("\n".join(buf))
@@ -161,16 +194,14 @@ class REPLManager:
     def _request(self, obj: dict, timeout: float) -> dict:
         """One request; on timeout or a dead process the REPL is restarted
         before the error propagates. A timed-out process is still computing
-        and would otherwise answer the *next* request with the stale response."""
+        and would otherwise answer the *next* request with the stale response.
+        Death is detected by the request itself (EOF / broken pipe), not by
+        poll(): stdout can close a moment before the exit status is reapable."""
         self.n_requests += 1
         try:
             return self.repl.request(obj, timeout)
-        except REPLTimeout:
+        except (REPLTimeout, REPLDead):
             self._restart()
-            raise
-        except REPLError:
-            if not self.repl.alive:
-                self._restart()
             raise
 
     # -- theorems and states -------------------------------------------------

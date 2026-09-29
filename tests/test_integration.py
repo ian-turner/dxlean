@@ -90,6 +90,26 @@ def test_timeout_restarts_and_replays(repl):
     assert repl.n_restarts == n_restarts
 
 
+def test_dead_process_restarts_and_replays(repl):
+    """A REPL that crashes mid-search (OOM kill, segfault, ...) must surface as a
+    tactic error and trigger a restart, never as a BrokenPipeError/EOF exception."""
+    thm = TheoremSpec("tst_dead", "theorem tst_dead (a b : Prop) (h : a ∧ b) : b ∧ a")
+    root = repl.init_theorem(thm)
+    mid = repl.apply_tactic(root, "constructor").state
+    assert mid is not None and len(mid.goals) == 2
+
+    n_restarts = repl.n_restarts
+    repl.repl.kill_group()  # simulate a crash of lake+repl; poll() may not see it yet
+    res = repl.apply_tactic(mid, "exact h.2")
+    assert res.status == "error" and "died" in res.message
+    assert repl.n_restarts == n_restarts + 1
+
+    # the new process elaborates the theorem again and replays `mid`
+    res = repl.apply_tactic(mid, "exact h.2")
+    assert res.status == "ok" and res.state is not None and len(res.state.goals) == 1
+    assert repl.n_restarts == n_restarts + 1
+
+
 def test_expand_handles_empty_action_lists(repl):
     """A solved state (and a state where every tactic fails) must flow through
     ActsEnum.expand without error — structural requirement for proof search."""
