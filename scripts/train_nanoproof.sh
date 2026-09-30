@@ -317,20 +317,25 @@ kill_stray_workers() {
     kill -9 $pids 2>/dev/null || true
 }
 
-# Each REPL worker opens and mmaps every .olean in its import closure (all of
-# Mathlib) and keeps the mappings for life, so it pins that many entries in the
-# kernel's system-wide open-file table (fs.file-max; /proc/sys/fs/file-nr reads
-# "used free max"). Overflowing it fails the import with "Too many open files in
-# system" (ENFILE), which no ulimit -n can fix. Estimate the per-worker cost from
-# the .olean count of the project's packages and toolchain and cap LEAN_PROCS to
-# what fits, leaving 10% of the table for everything else on the node.
+# Each REPL worker mmaps the module data of everything in its import closure (all
+# of Mathlib) and keeps the mappings for life, so it pins one entry per file in
+# the kernel's system-wide open-file table (fs.file-max; /proc/sys/fs/file-nr
+# reads "used free max"). Overflowing it fails the import with "Too many open
+# files in system" (ENFILE), which no ulimit -n can fix. The REPL is a non-module
+# importer, so Lean loads every part a module-system build has: .olean,
+# .olean.server, .olean.private and .ir (importModulesCore: findOLeanParts +
+# loadIR?), i.e. four entries per Mathlib module. Estimate the per-worker cost by
+# counting those files in the project's packages and toolchain (not *.olean*,
+# which also matches Lake's .olean.hash) and cap LEAN_PROCS to what fits,
+# leaving 10% of the table for everything else on the node.
 fit_lean_procs() {
     [ -r /proc/sys/fs/file-nr ] || return 0          # not Linux
     local used max per_worker headroom fit libdir
     read -r used _ max < /proc/sys/fs/file-nr
     libdir="$(cd "$LEAN_PROJECT" && lake env lean --print-libdir 2>/dev/null || true)"
-    per_worker=$(( $(find "$LEAN_PROJECT/.lake/packages" ${libdir:+"$libdir"} \
-        \( -name '*.olean' -o -name '*.olean.private' \) 2>/dev/null | wc -l) ))
+    per_worker=$(( $(find "$LEAN_PROJECT/.lake/packages" ${libdir:+"$libdir"} -type f \
+        \( -name '*.olean' -o -name '*.olean.server' -o -name '*.olean.private' \
+           -o -name '*.ir' \) 2>/dev/null | wc -l) ))
     [ "$per_worker" -gt 0 ] || return 0
     headroom=$(( (max - used) / 10 * 9 ))
     fit=$(( headroom / per_worker ))
@@ -350,7 +355,7 @@ server_died() {   # $1 = what happened; names the open-file-table failure when t
     if grep -q "Too many open files in system" "$SERVER_LOG"; then
         local used="?" max="?"
         read -r used _ max < /proc/sys/fs/file-nr 2>/dev/null || true
-        die "leanserver $1: the kernel's open-file table is full (fs.file-max=$max, $used in use now; every Mathlib worker pins one entry per .olean). Use fewer workers (NP_LEAN_PROCS), check for other Lean jobs on this node, or have an admin raise fs.file-max. ulimit -n cannot help"
+        die "leanserver $1: the kernel's open-file table is full (fs.file-max=$max, $used in use now; every Mathlib worker pins one entry per .olean/.olean.server/.olean.private/.ir file). Use fewer workers (NP_LEAN_PROCS), check for other Lean jobs on this node, or have an admin raise fs.file-max. ulimit -n cannot help"
     fi
     die "leanserver $1 (see log above)"
 }
@@ -415,7 +420,10 @@ do_leanserver() {
         local st; st="$(leanserver_status || true)"
         kill -0 "$pid" 2>/dev/null || server_died "died during warmup"
         case "$st" in
-            *'"status": "ready"'*|*'"status":"ready"'*) log "leanserver: warmup complete"; return ;;
+            *'"status": "ready"'*|*'"status":"ready"'*)
+                # actual table use, to check fit_lean_procs' estimate against
+                log "leanserver: warmup complete$([ -r /proc/sys/fs/file-nr ] && awk '{print "; open-file table " $1 "/" $3 " in use"}' /proc/sys/fs/file-nr)"
+                return ;;
             *'"status": "warming_up"'*|*'"status":"warming_up"'*) ;;
             *) sleep "$WARMUP_WAIT"; return ;;   # no warmup field: fixed head start
         esac
